@@ -1,6 +1,6 @@
 /*
  * =====================================================================
- * ESP32 Button Interrupt Example using Task Notification
+ * ESP32 Button Interrupt Example using FreeRTOS Software Timer
  * =====================================================================
  *
  * This example demonstrates:
@@ -9,9 +9,30 @@
  * 2. Internal pull-up resistor usage
  * 3. GPIO interrupt handling
  * 4. ISR (Interrupt Service Routine)
- * 5. Task Notification usage
- * 6. ISR -> Task communication
+ * 5. FreeRTOS Software Timer usage
+ * 6. ISR -> Timer -> Callback communication
  * 7. Software debounce
+ *
+ * =====================================================================
+ * IMPORTANT CONCEPT
+ * =====================================================================
+ *
+ * Timer is NOT directly replacing Queue/Semaphore/EventGroup
+ * as a signaling mechanism.
+ *
+ * Instead:
+ *
+ * ISR starts/restarts a software timer.
+ *
+ * When timer expires:
+ *      Timer callback function executes.
+ *
+ * This is commonly used for:
+ *
+ *      - debounce handling
+ *      - delayed processing
+ *      - retry mechanisms
+ *      - timeout systems
  *
  * =====================================================================
  * Hardware Connection
@@ -35,22 +56,23 @@
  *      GPIO_INTR_NEGEDGE
  *
  * =====================================================================
- * Why Use Task Notification?
+ * Why Use Timer for Debounce?
  * =====================================================================
  *
- * Task Notification is the lightest and fastest
- * ISR -> Task communication mechanism in FreeRTOS.
+ * Mechanical buttons bounce electrically.
  *
- * It is faster than:
- *      - Queue
- *      - Semaphore
+ * One physical press may generate multiple interrupts.
  *
- * Because:
- *      - no extra queue object
- *      - less RAM usage
- *      - lower overhead
+ * Instead of processing immediately:
  *
- * Very commonly used in professional RTOS systems.
+ * ISR starts a timer.
+ *
+ * Every bounce restarts the timer again.
+ *
+ * Only after signal becomes stable for 100ms:
+ *      timer callback executes.
+ *
+ * This is one of the BEST professional debounce methods.
  *
  * =====================================================================
  * Why ISR Should Be Short?
@@ -64,20 +86,9 @@
  *      - vTaskDelay()
  *      - heavy processing
  *
- * Therefore ISR only wakes the task using
- * task notification.
+ * Therefore ISR only restarts software timer.
  *
- * The task performs actual processing.
- *
- * =====================================================================
- * Debounce
- * =====================================================================
- *
- * Mechanical buttons bounce electrically.
- *
- * One physical press may generate multiple interrupts.
- *
- * We solve this using timestamp-based software debounce.
+ * The timer callback performs actual processing.
  *
  */
 
@@ -85,6 +96,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 
 #include "driver/gpio.h"
 
@@ -95,26 +107,43 @@
 #define BUTTON_GPIO GPIO_NUM_26
 
 // =====================================================================
-// Task Handle
+// Software Timer Handle
 // =====================================================================
 
 /*
- * Stores handle of button task.
+ * Handle for debounce timer.
  *
- * ISR uses this handle to notify the task.
+ * ISR restarts this timer whenever interrupt occurs.
  */
-static TaskHandle_t button_task_handle = NULL;
+static TimerHandle_t debounce_timer;
 
 // =====================================================================
-// Debounce Variable
+// Timer Callback Function
 // =====================================================================
 
 /*
- * Stores last valid button press time.
+ * This function executes when timer expires.
  *
- * Used to ignore bouncing interrupts.
+ * Timer expires only if:
+ *
+ * no new interrupt occurs within 100ms.
+ *
+ * Therefore signal is now stable.
  */
-static uint32_t last_press_time = 0;
+void debounce_timer_callback(TimerHandle_t xTimer)
+{
+    /*
+     * Validate button state.
+     *
+     * Since pull-up is enabled:
+     *
+     * Pressed = LOW = 0
+     */
+    if (gpio_get_level(BUTTON_GPIO) == 0)
+    {
+        printf("VALID BUTTON PRESS\n");
+    }
+}
 
 // =====================================================================
 // GPIO Interrupt Service Routine (ISR)
@@ -139,90 +168,27 @@ static void IRAM_ATTR gpio_isr_handler(void *arg)
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
     /*
-     * Send task notification from ISR.
-     *
-     * This wakes the blocked task.
+     * Restart timer from ISR.
      *
      * IMPORTANT:
      *
      * Use:
-     *      vTaskNotifyGiveFromISR()
+     *      xTimerResetFromISR()
      *
-     * because this API is ISR-safe.
+     * NOT:
+     *      xTimerReset()
+     *
+     * because ISR-safe APIs are required.
+     *
+     * Every bounce restarts timer again.
      */
-    vTaskNotifyGiveFromISR(button_task_handle,
-                           &xHigherPriorityTaskWoken);
+    xTimerResetFromISR(debounce_timer,
+                       &xHigherPriorityTaskWoken);
 
     /*
      * Request context switch if needed.
-     *
-     * If higher priority task woke up,
-     * scheduler immediately switches to it.
      */
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-}
-
-// =====================================================================
-// Button Processing Task
-// =====================================================================
-
-void button_task(void *arg)
-{
-    while (1)
-    {
-        /*
-         * Wait forever for task notification.
-         *
-         * ulTaskNotifyTake():
-         *      blocks task until notification arrives.
-         *
-         * pdTRUE:
-         *      clear notification value after receiving.
-         *
-         * portMAX_DELAY:
-         *      wait forever.
-         *
-         * Task enters BLOCKED state here and consumes
-         * almost zero CPU.
-         */
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-        /*
-         * Get current RTOS tick count.
-         */
-        uint32_t now = xTaskGetTickCount();
-
-        /*
-         * Software Debounce
-         *
-         * Ignore interrupts occurring within 100ms.
-         */
-        if ((now - last_press_time) > pdMS_TO_TICKS(100))
-        {
-            /*
-             * Optional extra validation.
-             *
-             * Check if button is STILL pressed.
-             *
-             * Since we use pull-up:
-             *
-             * Pressed = LOW = 0
-             */
-            if (gpio_get_level(BUTTON_GPIO) == 0)
-            {
-                printf("VALID BUTTON PRESS\n");
-
-                /*
-                 * Store current time as last valid press.
-                 */
-                last_press_time = now;
-            }
-        }
-        else
-        {
-            printf("BOUNCE IGNORED\n");
-        }
-    }
 }
 
 // =====================================================================
@@ -282,23 +248,32 @@ void app_main(void)
     gpio_config(&io_conf);
 
     // =================================================================
-    // Create Button Task
+    // Create Software Timer
     // =================================================================
 
     /*
-     * IMPORTANT:
+     * Timer Parameters:
      *
-     * Last parameter stores task handle.
+     * "debounce_timer"
+     *      Timer name
      *
-     * ISR needs this handle to notify task.
+     * pdMS_TO_TICKS(100)
+     *      Timer period = 100ms
+     *
+     * pdFALSE
+     *      One-shot timer
+     *
+     * NULL
+     *      Timer ID
+     *
+     * debounce_timer_callback
+     *      Function called when timer expires
      */
-    xTaskCreate(button_task,        // Task function
-                "button_task",      // Task name
-                2048,               // Stack size
-                NULL,               // Parameters
-                10,                 // Priority
-                &button_task_handle // Task handle
-    );
+    debounce_timer = xTimerCreate("debounce_timer",
+                                  pdMS_TO_TICKS(100),
+                                  pdFALSE,
+                                  NULL,
+                                  debounce_timer_callback);
 
     // =================================================================
     // Install GPIO ISR Service
@@ -313,9 +288,9 @@ void app_main(void)
     // Attach ISR Handler to GPIO
     // =================================================================
 
-    gpio_isr_handler_add(BUTTON_GPIO,     // GPIO number
-                         gpio_isr_handler,// ISR function
-                         NULL);           // ISR argument
+    gpio_isr_handler_add(BUTTON_GPIO,      // GPIO number
+                         gpio_isr_handler, // ISR function
+                         NULL);            // ISR argument
 
     printf("Waiting for button press...\n");
 }
