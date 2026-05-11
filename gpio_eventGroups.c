@@ -1,6 +1,6 @@
 /*
  * =====================================================================
- * ESP32 Button Interrupt Example using Task Notification
+ * ESP32 Button Interrupt Example using Event Groups
  * =====================================================================
  *
  * This example demonstrates:
@@ -9,7 +9,7 @@
  * 2. Internal pull-up resistor usage
  * 3. GPIO interrupt handling
  * 4. ISR (Interrupt Service Routine)
- * 5. Task Notification usage
+ * 5. Event Group usage
  * 6. ISR -> Task communication
  * 7. Software debounce
  *
@@ -35,22 +35,24 @@
  *      GPIO_INTR_NEGEDGE
  *
  * =====================================================================
- * Why Use Task Notification?
+ * Why Use Event Groups?
  * =====================================================================
  *
- * Task Notification is the lightest and fastest
- * ISR -> Task communication mechanism in FreeRTOS.
+ * Event Groups are used when:
  *
- * It is faster than:
- *      - Queue
- *      - Semaphore
+ *      - multiple events exist
+ *      - multiple tasks wait for events
+ *      - different event flags are needed
  *
- * Because:
- *      - no extra queue object
- *      - less RAM usage
- *      - lower overhead
+ * Event groups internally use bits.
  *
- * Very commonly used in professional RTOS systems.
+ * Example:
+ *
+ * Bit0 = Button Press
+ * Bit1 = WiFi Connected
+ * Bit2 = Sensor Ready
+ *
+ * Very useful in complex RTOS systems.
  *
  * =====================================================================
  * Why ISR Should Be Short?
@@ -64,8 +66,7 @@
  *      - vTaskDelay()
  *      - heavy processing
  *
- * Therefore ISR only wakes the task using
- * task notification.
+ * Therefore ISR only sets an event bit.
  *
  * The task performs actual processing.
  *
@@ -85,6 +86,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 
 #include "driver/gpio.h"
 
@@ -95,15 +97,29 @@
 #define BUTTON_GPIO GPIO_NUM_26
 
 // =====================================================================
-// Task Handle
+// Event Group Bit Definitions
 // =====================================================================
 
 /*
- * Stores handle of button task.
+ * BIT0 represents button press event.
  *
- * ISR uses this handle to notify the task.
+ * Binary:
+ *
+ * 00000001
  */
-static TaskHandle_t button_task_handle = NULL;
+#define BUTTON_PRESS_BIT    BIT0
+
+// =====================================================================
+// Event Group Handle
+// =====================================================================
+
+/*
+ * Event group handle.
+ *
+ * ISR sets event bits.
+ * Task waits for event bits.
+ */
+static EventGroupHandle_t button_event_group;
 
 // =====================================================================
 // Debounce Variable
@@ -139,19 +155,20 @@ static void IRAM_ATTR gpio_isr_handler(void *arg)
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
     /*
-     * Send task notification from ISR.
-     *
-     * This wakes the blocked task.
+     * Set event bit from ISR.
      *
      * IMPORTANT:
      *
      * Use:
-     *      vTaskNotifyGiveFromISR()
+     *      xEventGroupSetBitsFromISR()
      *
-     * because this API is ISR-safe.
+     * because normal APIs are not ISR-safe.
+     *
+     * This sets BUTTON_PRESS_BIT.
      */
-    vTaskNotifyGiveFromISR(button_task_handle,
-                           &xHigherPriorityTaskWoken);
+    xEventGroupSetBitsFromISR(button_event_group,
+                              BUTTON_PRESS_BIT,
+                              &xHigherPriorityTaskWoken);
 
     /*
      * Request context switch if needed.
@@ -171,21 +188,33 @@ void button_task(void *arg)
     while (1)
     {
         /*
-         * Wait forever for task notification.
+         * Wait forever until BUTTON_PRESS_BIT is set.
          *
-         * ulTaskNotifyTake():
-         *      blocks task until notification arrives.
+         * Parameters:
+         *
+         * button_event_group:
+         *      Event group handle
+         *
+         * BUTTON_PRESS_BIT:
+         *      Which bit to wait for
          *
          * pdTRUE:
-         *      clear notification value after receiving.
+         *      Clear bit automatically after wakeup
+         *
+         * pdFALSE:
+         *      Wait for ANY requested bit
          *
          * portMAX_DELAY:
-         *      wait forever.
+         *      Wait forever
          *
          * Task enters BLOCKED state here and consumes
          * almost zero CPU.
          */
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        xEventGroupWaitBits(button_event_group,
+                            BUTTON_PRESS_BIT,
+                            pdTRUE,
+                            pdFALSE,
+                            portMAX_DELAY);
 
         /*
          * Get current RTOS tick count.
@@ -282,23 +311,24 @@ void app_main(void)
     gpio_config(&io_conf);
 
     // =================================================================
-    // Create Button Task
+    // Create Event Group
     // =================================================================
 
     /*
-     * IMPORTANT:
-     *
-     * Last parameter stores task handle.
-     *
-     * ISR needs this handle to notify task.
+     * Create event group object.
      */
-    xTaskCreate(button_task,        // Task function
-                "button_task",      // Task name
-                2048,               // Stack size
-                NULL,               // Parameters
-                10,                 // Priority
-                &button_task_handle // Task handle
-    );
+    button_event_group = xEventGroupCreate();
+
+    // =================================================================
+    // Create Button Task
+    // =================================================================
+
+    xTaskCreate(button_task,     // Task function
+                "button_task",   // Task name
+                2048,            // Stack size
+                NULL,            // Parameters
+                10,              // Priority
+                NULL);           // Task handle
 
     // =================================================================
     // Install GPIO ISR Service
@@ -313,9 +343,9 @@ void app_main(void)
     // Attach ISR Handler to GPIO
     // =================================================================
 
-    gpio_isr_handler_add(BUTTON_GPIO,     // GPIO number
-                         gpio_isr_handler,// ISR function
-                         NULL);           // ISR argument
+    gpio_isr_handler_add(BUTTON_GPIO,      // GPIO number
+                         gpio_isr_handler, // ISR function
+                         NULL);            // ISR argument
 
     printf("Waiting for button press...\n");
 }
