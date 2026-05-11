@@ -1,6 +1,6 @@
 /*
  * =====================================================================
- * ESP32 Button Interrupt Example using Binary Semaphore
+ * ESP32 Button Interrupt Example using Task Notification
  * =====================================================================
  *
  * This example demonstrates:
@@ -9,7 +9,7 @@
  * 2. Internal pull-up resistor usage
  * 3. GPIO interrupt handling
  * 4. ISR (Interrupt Service Routine)
- * 5. Binary semaphore usage
+ * 5. Task Notification usage
  * 6. ISR -> Task communication
  * 7. Software debounce
  *
@@ -35,7 +35,25 @@
  *      GPIO_INTR_NEGEDGE
  *
  * =====================================================================
- * Why Use Semaphore?
+ * Why Use Task Notification?
+ * =====================================================================
+ *
+ * Task Notification is the lightest and fastest
+ * ISR -> Task communication mechanism in FreeRTOS.
+ *
+ * It is faster than:
+ *      - Queue
+ *      - Semaphore
+ *
+ * Because:
+ *      - no extra queue object
+ *      - less RAM usage
+ *      - lower overhead
+ *
+ * Very commonly used in professional RTOS systems.
+ *
+ * =====================================================================
+ * Why ISR Should Be Short?
  * =====================================================================
  *
  * ISR should execute very quickly.
@@ -46,7 +64,8 @@
  *      - vTaskDelay()
  *      - heavy processing
  *
- * Therefore ISR only wakes the task using semaphore.
+ * Therefore ISR only wakes the task using
+ * task notification.
  *
  * The task performs actual processing.
  *
@@ -66,7 +85,6 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
 
 #include "driver/gpio.h"
 
@@ -77,18 +95,15 @@
 #define BUTTON_GPIO GPIO_NUM_26
 
 // =====================================================================
-// Semaphore Handle
+// Task Handle
 // =====================================================================
 
 /*
- * Binary semaphore used for:
+ * Stores handle of button task.
  *
- * ISR  --->  Task signaling
- *
- * ISR gives semaphore.
- * Task takes semaphore.
+ * ISR uses this handle to notify the task.
  */
-static SemaphoreHandle_t button_semaphore = NULL;
+static TaskHandle_t button_task_handle = NULL;
 
 // =====================================================================
 // Debounce Variable
@@ -124,20 +139,19 @@ static void IRAM_ATTR gpio_isr_handler(void *arg)
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
     /*
-     * Give semaphore from ISR.
+     * Send task notification from ISR.
+     *
+     * This wakes the blocked task.
      *
      * IMPORTANT:
      *
      * Use:
-     *      xSemaphoreGiveFromISR()
+     *      vTaskNotifyGiveFromISR()
      *
-     * NOT:
-     *      xSemaphoreGive()
-     *
-     * because normal APIs are not ISR-safe.
+     * because this API is ISR-safe.
      */
-    xSemaphoreGiveFromISR(button_semaphore,
-                          &xHigherPriorityTaskWoken);
+    vTaskNotifyGiveFromISR(button_task_handle,
+                           &xHigherPriorityTaskWoken);
 
     /*
      * Request context switch if needed.
@@ -157,50 +171,56 @@ void button_task(void *arg)
     while (1)
     {
         /*
-         * Wait forever until semaphore becomes available.
+         * Wait forever for task notification.
          *
-         * Initially semaphore is EMPTY.
+         * ulTaskNotifyTake():
+         *      blocks task until notification arrives.
+         *
+         * pdTRUE:
+         *      clear notification value after receiving.
+         *
+         * portMAX_DELAY:
+         *      wait forever.
          *
          * Task enters BLOCKED state here and consumes
          * almost zero CPU.
          */
-        if (xSemaphoreTake(button_semaphore, portMAX_DELAY))
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        /*
+         * Get current RTOS tick count.
+         */
+        uint32_t now = xTaskGetTickCount();
+
+        /*
+         * Software Debounce
+         *
+         * Ignore interrupts occurring within 100ms.
+         */
+        if ((now - last_press_time) > pdMS_TO_TICKS(100))
         {
             /*
-             * Get current RTOS tick count.
-             */
-            uint32_t now = xTaskGetTickCount();
-
-            /*
-             * Software Debounce
+             * Optional extra validation.
              *
-             * Ignore interrupts occurring within 50ms.
+             * Check if button is STILL pressed.
+             *
+             * Since we use pull-up:
+             *
+             * Pressed = LOW = 0
              */
-            if ((now - last_press_time) > pdMS_TO_TICKS(100))
+            if (gpio_get_level(BUTTON_GPIO) == 0)
             {
-                /*
-                 * Optional extra validation.
-                 *
-                 * Check if button is STILL pressed.
-                 *
-                 * Since we use pull-up:
-                 *
-                 * Pressed = LOW = 0
-                 */
-                if (gpio_get_level(BUTTON_GPIO) == 0)
-                {
-                    printf("VALID BUTTON PRESS\n");
+                printf("VALID BUTTON PRESS\n");
 
-                    /*
-                     * Store current time as last valid press.
-                     */
-                    last_press_time = now;
-                }
+                /*
+                 * Store current time as last valid press.
+                 */
+                last_press_time = now;
             }
-            else
-            {
-                printf("BOUNCE IGNORED\n");
-            }
+        }
+        else
+        {
+            printf("BOUNCE IGNORED\n");
         }
     }
 }
@@ -262,26 +282,23 @@ void app_main(void)
     gpio_config(&io_conf);
 
     // =================================================================
-    // Create Binary Semaphore
-    // =================================================================
-
-    /*
-     * Initially semaphore is EMPTY.
-     *
-     * Task will block until ISR gives semaphore.
-     */
-    button_semaphore = xSemaphoreCreateBinary();
-
-    // =================================================================
     // Create Button Task
     // =================================================================
 
-    xTaskCreate(button_task,     // Task function
-                "button_task",   // Task name
-                2048,            // Stack size
-                NULL,            // Parameters
-                10,              // Priority
-                NULL);           // Task handle
+    /*
+     * IMPORTANT:
+     *
+     * Last parameter stores task handle.
+     *
+     * ISR needs this handle to notify task.
+     */
+    xTaskCreate(button_task,        // Task function
+                "button_task",      // Task name
+                2048,               // Stack size
+                NULL,               // Parameters
+                10,                 // Priority
+                &button_task_handle // Task handle
+    );
 
     // =================================================================
     // Install GPIO ISR Service
@@ -296,9 +313,9 @@ void app_main(void)
     // Attach ISR Handler to GPIO
     // =================================================================
 
-    gpio_isr_handler_add(BUTTON_GPIO,   // GPIO number
-                         gpio_isr_handler, // ISR function
-                         NULL);            // ISR argument
+    gpio_isr_handler_add(BUTTON_GPIO,     // GPIO number
+                         gpio_isr_handler,// ISR function
+                         NULL);           // ISR argument
 
     printf("Waiting for button press...\n");
 }
